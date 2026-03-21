@@ -1,4 +1,9 @@
 #pragma once
+
+#ifndef TWAI_ERROR_MONITOR_STACK_SIZE
+#define TWAI_ERROR_MONITOR_STACK_SIZE 2048
+#endif
+
 #include "freertos/FreeRTOS.h"
 #include "driver/gpio.h"
 #include "driver/twai.h"

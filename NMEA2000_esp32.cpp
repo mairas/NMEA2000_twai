@@ -82,7 +82,7 @@ bool tNMEA2000_esp32::CANOpen()
     if (is_open_) return true;
     CAN_init();
     //is_open_ = true;
-    xTaskCreate(errorMonitorTask, "TWAI_errMonitor", 4096, this, 5, &error_monitor_task_handle_);
+    xTaskCreate(errorMonitorTask, "TWAI_errMonitor", TWAI_ERROR_MONITOR_STACK_SIZE, this, 5, &error_monitor_task_handle_);
     return true;
 }
 
