@@ -141,12 +141,12 @@ bool tNMEA2000_esp32::CANSendFrame(unsigned long id, unsigned char len, const un
         .data = {0}
     };
     memcpy(message.data, buf, message.data_length_code);
-    //todo this could use some love when doing microsleep
-    esp_err_t result = twai_transmit_v2(twai_handle_, &message, wait_sent ? pdMS_TO_TICKS(100) : 0);
-    if (result != ESP_OK)
-    {
-        //ESP_LOGE(TAG, "Failed to transmit message: %s", esp_err_to_name(result));
-    }
+    // Never block on transmit. The TWAI driver has its own TX queue for
+    // buffering, and the NMEA2000 library maintains a send buffer above
+    // this layer. Blocking here (e.g. 100ms per frame) causes catastrophic
+    // event loop stalls when the CAN bus is faulty or unterminated and the
+    // controller enters bus-off recovery.
+    esp_err_t result = twai_transmit_v2(twai_handle_, &message, 0);
     return (result == ESP_OK);
 }
 
