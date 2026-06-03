@@ -10,7 +10,11 @@ tNMEA2000_esp32::tNMEA2000_esp32(
     CAN_speed_t can_speed) : tNMEA2000(),
                              is_open_(false),
                              error_monitor_task_handle_(nullptr),
-                             should_stop_error_monitor_(false)
+                             should_stop_error_monitor_(false),
+                             error_monitor_running_(false),
+                             can_mutex_(xSemaphoreCreateMutex()),
+                             not_open_reported_(false),
+                             busoff_reported_(false)
 {
     switch (can_speed)
     {
@@ -55,11 +59,18 @@ tNMEA2000_esp32::tNMEA2000_esp32(
 tNMEA2000_esp32::~tNMEA2000_esp32()
 {
     should_stop_error_monitor_ = true;
-    if (error_monitor_task_handle_ != nullptr)
+    // Wait for the monitor task to exit on its own (it deletes itself when it
+    // sees the stop flag) rather than force-deleting it, so it is never killed
+    // while holding can_mutex_. Capped so a wedged task can't hang teardown.
+    for (int i = 0; error_monitor_running_ && i < 500; i++)
     {
-        vTaskDelete(error_monitor_task_handle_);
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
     CAN_deinit();
+    if (can_mutex_ != nullptr)
+    {
+        vSemaphoreDelete(can_mutex_);
+    }
 }
 
 void tNMEA2000_esp32::SetCANBufferSize(uint16_t RxBufferSize, uint16_t TxBufferSize)
@@ -82,20 +93,30 @@ bool tNMEA2000_esp32::CANOpen()
     if (is_open_) return true;
     CAN_init();
     //is_open_ = true;
-    xTaskCreate(errorMonitorTask, "TWAI_errMonitor", TWAI_ERROR_MONITOR_STACK_SIZE, this, 5, &error_monitor_task_handle_);
+    if (xTaskCreate(errorMonitorTask, "TWAI_errMonitor", TWAI_ERROR_MONITOR_STACK_SIZE, this, 5, &error_monitor_task_handle_) == pdPASS)
+    {
+        error_monitor_running_ = true;
+    }
     return true;
 }
 
 void tNMEA2000_esp32::CAN_init()
 {
-    ESP_LOGI(TAG, "Initializing TWAI driver");
+    xSemaphoreTake(can_mutex_, portMAX_DELAY);
+    if (!busoff_reported_)
+    {
+        ESP_LOGI(TAG, "Initializing TWAI driver");
+    }
     esp_err_t result = twai_driver_install_v2(&g_config_, &t_config_, &f_config_, &twai_handle_);
     if (result == ESP_OK)
     {
         result = twai_start_v2(twai_handle_);
         if (result == ESP_OK)
         {
-            ESP_LOGI(TAG, "TWAI driver started successfully");
+            if (!busoff_reported_)
+            {
+                ESP_LOGI(TAG, "TWAI driver started successfully");
+            }
             is_open_ = true;
         }
         else
@@ -107,23 +128,36 @@ void tNMEA2000_esp32::CAN_init()
     {
         ESP_LOGE(TAG, "Failed to install TWAI driver: %s", esp_err_to_name(result));
     }
+    xSemaphoreGive(can_mutex_);
 }
 
 void tNMEA2000_esp32::CAN_deinit()
 {
+    xSemaphoreTake(can_mutex_, portMAX_DELAY);
     if (is_open_)
     {
-        ESP_LOGI(TAG, "Stopping TWAI driver");
+        // Mark closed before tearing down so a concurrent send/receive that
+        // is waiting on the mutex sees the closed state once it acquires it.
+        is_open_ = false;
+        if (!busoff_reported_)
+        {
+            ESP_LOGI(TAG, "Stopping TWAI driver");
+        }
         twai_stop_v2(twai_handle_);
         twai_driver_uninstall_v2(twai_handle_);
-        is_open_ = false;
     }
+    xSemaphoreGive(can_mutex_);
 }
 
 bool tNMEA2000_esp32::CANSendFrame(unsigned long id, unsigned char len, const unsigned char* buf, bool wait_sent)
 {
+    xSemaphoreTake(can_mutex_, portMAX_DELAY);
     if (!is_open_) {
-        ESP_LOGI(TAG, "CANSendFrame - not open...");
+        xSemaphoreGive(can_mutex_);
+        if (!not_open_reported_) {
+            ESP_LOGE(TAG, "CAN port not open; suppressing further messages until recovery");
+            not_open_reported_ = true;
+        }
         return false;
     }
 
@@ -147,24 +181,41 @@ bool tNMEA2000_esp32::CANSendFrame(unsigned long id, unsigned char len, const un
     // event loop stalls when the CAN bus is faulty or unterminated and the
     // controller enters bus-off recovery.
     esp_err_t result = twai_transmit_v2(twai_handle_, &message, 0);
+    xSemaphoreGive(can_mutex_);
     return (result == ESP_OK);
 }
 
 bool tNMEA2000_esp32::CANGetFrame(unsigned long& id, unsigned char& len, unsigned char* buf)
 {
+    xSemaphoreTake(can_mutex_, portMAX_DELAY);
     if (!is_open_) {
-        ESP_LOGI(TAG, "CANGetFrame - not open...");
+        xSemaphoreGive(can_mutex_);
+        if (!not_open_reported_) {
+            ESP_LOGE(TAG, "CAN port not open; suppressing further messages until recovery");
+            not_open_reported_ = true;
+        }
         return false;
     }
     twai_message_t message;
-    if (twai_receive_v2(twai_handle_, &message, 0) == ESP_OK)
+    bool received = (twai_receive_v2(twai_handle_, &message, 0) == ESP_OK);
+    xSemaphoreGive(can_mutex_);
+
+    if (!received)
     {
-        id = message.identifier;
-        len = message.data_length_code;
-        memcpy(buf, message.data, len);
-        return true;
+        return false;
     }
-    return false;
+
+    // A received frame means the bus is alive again: re-arm the report-once
+    // flags so a future outage is reported.
+    if (busoff_reported_ || not_open_reported_) {
+        ESP_LOGI(TAG, "CAN bus recovered");
+        busoff_reported_ = false;
+        not_open_reported_ = false;
+    }
+    id = message.identifier;
+    len = message.data_length_code;
+    memcpy(buf, message.data, len);
+    return true;
 }
 
 void tNMEA2000_esp32::errorMonitorTask(void* pvParameters)
@@ -172,8 +223,7 @@ void tNMEA2000_esp32::errorMonitorTask(void* pvParameters)
     auto* instance = static_cast<tNMEA2000_esp32*>(pvParameters);
     twai_status_info_t status_info;
 
-    // Timestamps for last logged messages (in milliseconds)
-    uint32_t last_busoff_log = 0;
+    // Timestamp for the last high-error-counter warning (in milliseconds)
     uint32_t last_highcounter_log = 0;
     const uint32_t LOG_INTERVAL = 60000; // 1 minute in milliseconds
 
@@ -185,11 +235,7 @@ void tNMEA2000_esp32::errorMonitorTask(void* pvParameters)
         {
             if (status_info.state == TWAI_STATE_BUS_OFF)
             {
-                if (current_time - last_busoff_log >= LOG_INTERVAL)
-                {
-                    ESP_LOGE(TAG, "Bus-off condition detected");
-                    last_busoff_log = current_time;
-                }
+                // handleBusError reports the bus-off once and reinitializes.
                 instance->handleBusError();
             }
             else if (status_info.tx_error_counter > 127 || status_info.rx_error_counter > 127)
@@ -205,12 +251,18 @@ void tNMEA2000_esp32::errorMonitorTask(void* pvParameters)
         vTaskDelay(pdMS_TO_TICKS(1000)); // Check every second
     }
 
+    instance->error_monitor_running_ = false;
     vTaskDelete(nullptr);
 }
 
 void tNMEA2000_esp32::handleBusError()
 {
-    ESP_LOGI(TAG, "Handling bus error: Reinitializing TWAI driver");
+    // Report once per outage; the flag (cleared on recovery in CANGetFrame)
+    // also silences the per-cycle reinit logs in CAN_deinit/CAN_init.
+    if (!busoff_reported_) {
+        ESP_LOGE(TAG, "Bus-off; reinitializing TWAI every 2s, suppressing further messages until recovery");
+        busoff_reported_ = true;
+    }
     CAN_deinit();
     vTaskDelay(pdMS_TO_TICKS(1000)); // Wait for 1 second before reinitializing
     CAN_init();

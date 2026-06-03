@@ -5,6 +5,7 @@
 #endif
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "driver/gpio.h"
 #include "driver/twai.h"
 #include "NMEA2000.h"
@@ -53,4 +54,16 @@ private:
     bool is_open_;
     TaskHandle_t error_monitor_task_handle_;
     volatile bool should_stop_error_monitor_;
+    // True while the error-monitor task is alive; lets the destructor wait for
+    // the task to exit on its own instead of force-deleting it (which could
+    // kill it while it holds can_mutex_ and deadlock CAN_deinit).
+    volatile bool error_monitor_running_;
+
+    // Serializes access to the TWAI handle so the error-monitor task cannot
+    // uninstall the driver while another task is transmitting or receiving.
+    SemaphoreHandle_t can_mutex_;
+    // "Report once" flags, re-armed only on genuine recovery (a received
+    // frame), to keep a missing/faulty bus from flooding the log.
+    bool not_open_reported_;
+    bool busoff_reported_;
 };
